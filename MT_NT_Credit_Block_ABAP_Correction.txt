@@ -1,0 +1,124 @@
+================================================================================
+  ZAPO_GATP_ALLOCATION_F005 — Credit block visibility (NT/MT report)
+  Apply in SAP ADT / SE80. Adjust indentation to match your include.
+  Prerequisite: get_param_data( ) should run BEFORE get_data so gt_zapoparam
+  is filled when NT_MT_NEW rows exist. If not, rely on KCQTY branch below.
+================================================================================
+
+--------------------------------------------------------------------------------
+CORRECTION 1 — get_data: do not drop /SAPAPO/QTTAB rows with AEMENGE = 0 when
+             NT/MT is active OR when KCQTY still shows allocation
+--------------------------------------------------------------------------------
+Location: LOOP AT gt_qttab (inside get_data / build gt_output), immediately
+          before APPEND gw_output TO gt_output.
+
+REPLACE this block:
+
+                  IF lw_qttab-aemenge IS INITIAL AND p_report = abap_true.
+                    CLEAR: lw_dyn, lw_matloc, gw_matclass.
+                    CONTINUE.
+                  ENDIF.
+
+WITH:
+
+* Credit block / NT-MT: keep PAG CVC when AEMENGE=0 if allocation exists on
+* quota (KCQTY) or when NT/MT switch is on (gt_zapoparam from get_param_data).
+                  IF lw_qttab-aemenge IS INITIAL AND p_report = abap_true.
+                    READ TABLE gt_zapoparam TRANSPORTING NO FIELDS
+                         WITH KEY param1 = 'GATP'.
+                    IF sy-subrc <> 0 AND lw_qttab-kcqty IS INITIAL.
+                      CLEAR: lw_dyn, lw_matloc, gw_matclass.
+                      CONTINUE.
+                    ENDIF.
+                  ENDIF.
+
+Notes:
+- If credit orders can have BOTH AEMENGE = 0 AND KCQTY = 0 in your PAG build,
+  extend this IF with an additional OR (e.g. existence check on ZAPO_SO_LIST
+  for CMGST = B for same PLUID/CVC) — project-specific.
+- If get_param_data runs after get_data, either reorder in parent report
+  ZAPO_GATP_ALLOCATION_REPORT or temporarily treat "always keep row" by
+  removing the inner IF and only testing KCQTY (business decision).
+
+
+--------------------------------------------------------------------------------
+CORRECTION 2 — collect_final_output: include REQ_NT/REQ_MT = 'KL' in lt_cb_ord
+          (align with lt_so_cap)
+--------------------------------------------------------------------------------
+Location: LOOP AT lt_so_all INTO lw_so_all (CHANGE C / SO_LIST monthly cap).
+
+REPLACE the lt_cb_ord fill condition:
+
+        IF lw_so_all-cmgst = 'B'
+        AND lw_so_all-abgru = space
+        AND ( lw_so_all-req_nt = 'Z1'
+        OR lw_so_all-req_nt = 'KSV'
+        OR lw_so_all-req_mt = 'Z1'
+        OR lw_so_all-req_mt = 'KSV' ).
+
+WITH:
+
+        IF lw_so_all-cmgst = 'B'
+        AND lw_so_all-abgru = space
+        AND ( lw_so_all-req_nt = 'Z1'
+        OR lw_so_all-req_nt = 'KSV'
+        OR lw_so_all-req_nt = 'KL'
+        OR lw_so_all-req_mt = 'Z1'
+        OR lw_so_all-req_mt = 'KSV'
+        OR lw_so_all-req_mt = 'KL' ).
+
+
+--------------------------------------------------------------------------------
+CORRECTION 3 — collect_final_output: plant credit + depot credit (CORRECTED)
+--------------------------------------------------------------------------------
+Do NOT nest IF lw_loc_type_c = '1002' inside IF lw_loc_type_c = '1001' — that
+is dead code and removes the plant READ lt_cb_ord path. Validated on AD1.
+
+A) INSIDE  IF lw_loc_type_c = '1001'.  after lw_remaining assignment, use:
+
+                        " Add credit block orders to PAG AEMENGE (BR5) — plant
+                        READ TABLE lt_cb_ord INTO lw_cb_ord
+                             WITH KEY gccode = <fs_output>-grp_cust
+                                      matnr  = <fs_output>-material
+                                      werks  = <fs_output>-location
+                                      vtweg  = <fs_output>-dist_chan
+                                      spart  = <fs_output>-div BINARY SEARCH.
+                        IF sy-subrc = 0.
+                          lw_cb_qty = lw_cb_ord-cb_qty.
+                        ELSE.
+                          CLEAR lw_cb_qty.
+                        ENDIF.
+                        <fs_output>-inc_ord_quan = <fs_output>-inc_ord_quan + lw_cb_qty.
+
+                        " Cap to remaining headroom (prevents BE/FL/DZ daily inflation)
+                        IF <fs_output>-inc_ord_quan > lw_remaining.
+                          <fs_output>-inc_ord_quan = lw_remaining.
+                        ENDIF.
+
+                      ENDIF.  " end Plant logic
+
+B) IMMEDIATELY AFTER that ENDIF, BEFORE "BOTH PLANT + DEPOT: MT from ZAPO_ADB_ADJ":
+
+                      IF lw_loc_type_c = '1002'.
+                        CLEAR lw_cb_qty.
+                        READ TABLE lt_cb_ord INTO lw_cb_ord
+                             WITH KEY gccode = <fs_output>-grp_cust
+                                      matnr  = <fs_output>-material
+                                      werks  = <fs_output>-location
+                                      vtweg  = <fs_output>-dist_chan
+                                      spart  = <fs_output>-div BINARY SEARCH.
+                        IF sy-subrc = 0.
+                          lw_cb_qty = lw_cb_ord-cb_qty.
+                        ENDIF.
+                        <fs_output>-inc_ord_quan = <fs_output>-inc_ord_quan + lw_cb_qty.
+                      ENDIF.
+
+Apply A+B in BOTH duplicated branches of the include. See also
+MT_NT_Credit_Block_HOTFIX_Validation_AD1.txt if wrong nested code was already
+transported.
+
+
+================================================================================
+After transport: syntax check, execute ZGATPDB — scenarios CB-1..CB-4 from
+MT_NT_Credit_Block_Code_Change_v1.md
+================================================================================
