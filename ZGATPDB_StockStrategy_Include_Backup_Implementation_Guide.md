@@ -1,177 +1,138 @@
-# Implementation Guide — Stock Strategy in `ZAPO_PRIME_BCKU` (mid-month KL ↔ Allocation)
+# Implementation Guide — Stock Strategy KL into `NO_TOUCH` / `ZAPO_PRIME_BCKU`
 
-**System:** DEVSCMAD1  
+**System:** DEVSCMAD1 (validated via AD1 MCP 04/08/2026)  
 **Program / Include:** `ZAPO_GATP_ALLOCATION_REPORT` / `ZAPO_GATP_ALLOCATION_F005`  
 **T-code:** `ZGATPDB`  
 **Param scope:** **New only** (`gt_zapoparam` `param1 = 'GATP'`)  
-**Analysis doc:** `ZGATPDB_StockStrategy_Include_Backup_MidMonth_Switch_Code_Correction.md`  
-**Version:** 1.0 — 04/08/2026  
+**Version:** 1.1 — 04/08/2026  
 
 ---
 
-## 0. Purpose
+## A. Requirement (authoritative)
 
-Implement today’s three mandatory changes so Stock Strategy (`REQ_NT = 'KL'`) is stored in `ZAPO_PRIME_BCKU` under New Param, NT nets like Allocation Strategy, and mid-month KL ↔ Allocation keeps history intact.
+| # | Requirement | Meaning |
+|---|-------------|---------|
+| R1 | Store Stock Strategy (`REQ_NT = 'KL'`) in **No Touch** | `NO_TOUCH` in `ZAPO_PRIME_BCKU` = **existing NO_TOUCH logic + KL quantity** |
+| R2 | Same value for **display** | Daily / MTD popup NT must read the same stored / computed `NO_TOUCH` (no parallel “KL-only side path” that disagrees with backup) |
+| R3 | **Do not disturb** existing report generation | Keep CHANGE F Plant formula, Old param, Depot legacy, RDD filters, ALV build — only open the backup exclude and align MTD so KL is not double-counted |
 
-| ID | Method | What |
-|----|--------|------|
-| **SS1** | `collect_final_output` | Old-only KL exclude; New append KL CVCs to backup |
-| **SS2** | `merge_kl_so_cvc_to_output` | New Plant KL qty = netted NT (SO − MTD BCKU) |
-| **SS3** | `pull_data_prime_buck` | New Plant: stop KL SO additive (avoid double count) |
+```text
+NO_TOUCH (store + display) = Existing_NT + KL_qty
+```
 
-**Do not touch:** Old param paths, Depot legacy KL add, CHANGE F Plant formula, KL RDD Plant filters, FIX-KL-POP structure.
+| Case | Existing_NT | KL_qty | Result |
+|------|-------------|--------|--------|
+| Allocation CVC only | From current CHANGE F | 0 | Unchanged |
+| Pure Stock Strategy CVC | 0 | KL | `NO_TOUCH = KL` → must be **saved** |
+| Same CVC with Alloc + KL | CHANGE F already uses month SO WMENG incl. KL | (already inside Existing_NT) | Save as today — **do not add KL again** |
 
 ---
 
-## 1. Pre-checks (before edit)
+## B. Fit analysis — previous guide vs this requirement (AD1 live)
+
+### B.1 What AD1 does today
+
+| Layer | Live behaviour | Fits R1–R3? |
+|-------|----------------|-------------|
+| CHANGE F Plant NT | `NO_TOUCH = month WMENG (Z1/KSV/**KL**) − MTD(BCKU MT+NT) − ADB MT` | Existing logic **already includes KL in SO** for CVCs on the grid |
+| `collect_final_output` **FIX-KL-BAK Obs2** | Pure KL (`ALLOC=0`, no UA) → **`CONTINUE`** — never write BCKU; merge only fills `lt_kl_chk` | **Fails R1** |
+| Daily popup **FIX-KL-POP** | Adds KL from `gt_fetch_outtab` for CVCs missing on grid | Display has KL; backup does not → **Fails R2** |
+| MTD `pull_data_prime_buck` | BCKU + KL SO additive (because Obs2 said KL not in BCKU) | Needed today; **must change** once KL is in BCKU or **Fails R2** (double) |
+
+### B.2 Previous guide (v1.0) scorecard
+
+| Step | Intent | Fit to R1–R3 | Verdict |
+|------|--------|--------------|---------|
+| **SS1A** Old-only exclude | Allow New to save pure KL | **Required for R1** | **Keep** |
+| **SS1B** Append missing KL CVCs to `lt_output` | Pure KL not on grid still backs up | **Required for R1** | **Keep** (move before FAE SELECT) |
+| **SS2** Net KL with `SELECT SUM(BCKU)` inside `merge_kl` | Mid-month / reappear control | **Over-engineered for R1** — can change popup qty path; risks confusing “existing + KL” | **Simplify / optional** — prefer save **Existing_NT + KL** without new SELECT in merge |
+| **SS3** Stop Plant New MTD KL SO add | Avoid BCKU + SO double | **Required for R2** once KL in BCKU | **Keep** |
+
+### B.3 Gaps vs “existing + KL”
+
+1. **SS2 as written** replaces KL with `KL − MTD BCKU` inside `merge_kl`. That is useful for pure-KL shells, but it is **not** the same wording as “existing logic + KL”, and it touches a method also used for **display** (FIX-KL-POP). Prefer: **do not change merge qty formula** unless needed; store whatever `no_touch` already is on the row (CHANGE F or merge’s current KL sum).  
+2. Guide did **not** say explicitly: for CVCs **already** on `lt_output`, **never add KL twice** (CHANGE F already counted KL in WMENG). SS1B already skips existing keys — keep that.  
+3. **R3**: Do **not** change CHANGE F, `get_data` ALV, Old param, Depot SO add.
+
+---
+
+## C. Target design (minimal disturbance)
+
+```text
+Backup (New):
+  1. Keep existing lt_output NO_TOUCH from CHANGE F  (already Existing + KL in SO formula)
+  2. Remove New-param Obs2 skip so those rows SAVE
+  3. Append pure-KL CVCs missing from lt_output with no_touch = KL (merge_kl current qty)
+  4. MODIFY ZAPO_PRIME_BCKU.NO_TOUCH as today
+
+Display:
+  Daily: grid NO_TOUCH + FIX-KL-POP for missing KL CVCs (unchanged structure)
+  MTD New Plant: SUM(BCKU) only — SS3 stops SO KL add
+  MTD Old / Depot: unchanged
+```
+
+```mermaid
+flowchart LR
+  A[CHANGE F Existing_NT] --> D[NO_TOUCH on lt_output]
+  B[Pure KL via merge] --> D
+  D --> E[ZAPO_PRIME_BCKU.NO_TOUCH]
+  E --> F[MTD display New Plant]
+  D --> G[Daily display]
+```
+
+---
+
+## 0. Purpose (implementation)
+
+| ID | Method | What | Disturbs existing report? |
+|----|--------|------|---------------------------|
+| **SS1** | `collect_final_output` | Save KL into `NO_TOUCH` (allow + append) | **No** — backup only |
+| **SS3** | `pull_data_prime_buck` | New Plant MTD from BCKU only | **No** for Old/Depot; aligns New Plant display with store |
+| **SS2** | `merge_kl` | **Optional** — only if pure-KL popup must net prior BCKU | Avoid unless T2 fails |
+
+**Do not touch:** CHANGE F, Old Obs2 behaviour (keep for Old), Depot KL add, RDD filters, FIX-KL-POP loop structure.
+
+---
+
+## 1. Pre-checks
 
 | # | Check | How |
 |---|--------|-----|
-| 1 | Open include on AD1 | SE80 / ADT → `ZAPO_GATP_ALLOCATION_F005` |
-| 2 | Confirm FIX-KL-BAK Obs2 exists | Search `FIX-KL-BAK` or `lt_kl_chk` |
-| 3 | Confirm New param flag usage | Search `param1 = 'GATP'` |
-| 4 | Confirm MTD KL add comment | Search `KL not in ZAPO_PRIME_BCKU` |
-| 5 | Create transport | Workbench TR for include only |
-| 6 | Note a test CVC | One Plant `1001` material with `REQ_NT='KL'` today |
-
-**Backup of source:** Download current F005 version into TR before change (or copy to local).
+| 1 | Open `ZAPO_GATP_ALLOCATION_F005` on AD1 | SE80 / ADT |
+| 2 | Confirm `FIX-KL-BAK` / `lt_kl_chk` | Search |
+| 3 | Confirm MTD comment Obs2 | Search `KL not in ZAPO_PRIME_BCKU` |
+| 4 | Transport | Workbench TR — include only |
+| 5 | Test CVC | Plant `1001`, `REQ_NT='KL'`, `BMENG>0`, `EDATU=sy-datum` |
 
 ---
 
-## 2. Implementation order (mandatory)
+## 2. Implementation order
 
 ```text
-1) SS2  — merge_kl netting          (qty correct before append/save)
-2) SS1  — collect_final_output      (allow + append KL to backup)
-3) SS3  — pull_data_prime_buck      (stop Plant New double count)
-4) Syntax check → activate
-5) Unit test T1–T6
+1) SS1  — collect_final_output (R1 store)
+2) SS3  — pull_data_prime_buck (R2 no double MTD)
+3) Syntax check → activate
+4) Test T1–T6
+5) SS2 only if T2 (next-day reappear) fails for pure KL
 ```
-
-Do **not** activate SS1 without SS3 — MTD would double-count Plant KL.
 
 ---
 
-## 3. STEP SS2 — `merge_kl_so_cvc_to_output` (netted qty)
+## 3. STEP SS1 — Store KL in `NO_TOUCH` via backup
 
-### 3.1 Find
+### 3.1 SS1A — Old-only exclude (New must save)
 
-Search for:
-
-```abap
-IF lv_new_param = abap_true.
-  CLEAR lv_so_nt_kl.
-  LOOP AT lt_fetch_all INTO lw_fetch_sum
-```
-
-(inside `merge_kl_so_cvc_to_output`, after building `lw_fetch_outtab` keys).
-
-### 3.2 Add local DATA (top of method, with other DATA)
-
-```abap
-DATA: lv_saved_prime TYPE zbmeng,
-      lv_sum_mt      TYPE zapo_prime_bcku-manual_touch,
-      lv_sum_nt      TYPE zapo_prime_bcku-no_touch,
-      lv_month_start TYPE dats,
-      lv_yesterday   TYPE dats.
-```
-
-(Reuse existing `lv_month_start` if already declared in this method — do not duplicate.)
-
-### 3.3 Replace New-param qty block
-
-**Replace** the block that only does:
-
-```abap
-lv_so_nt_kl = lv_so_nt_kl + lw_fetch_sum-bmeng.
-...
-lw_fetch_outtab-no_touch     = lv_so_nt_kl.
-lw_fetch_outtab-inc_ord_quan = lv_so_nt_kl.
-```
-
-**With:**
-
-```abap
-        IF lv_new_param = abap_true.
-          CLEAR lv_so_nt_kl.
-          LOOP AT lt_fetch_all INTO lw_fetch_sum
-            WHERE matnr  = lw_fetch_outtab-material
-              AND werks  = lw_fetch_outtab-location
-              AND vtweg  = lw_fetch_outtab-dist_chan
-              AND spart  = lw_fetch_outtab-div
-              AND gccode = lw_fetch_outtab-grp_cust.
-            lv_so_nt_kl = lv_so_nt_kl + lw_fetch_sum-bmeng.
-          ENDLOOP.
-
-*--- SS2: New — net prior MTD BCKU (MT+NT), same spirit as CHANGE F
-          CLEAR: lv_saved_prime, lv_sum_mt, lv_sum_nt.
-          CONCATENATE sy-datum+0(6) '01' INTO lv_month_start.
-          lv_yesterday = sy-datum - 1.
-          IF lv_yesterday >= lv_month_start.
-            SELECT SUM( manual_touch )
-                   SUM( no_touch )
-              INTO (lv_sum_mt, lv_sum_nt)
-              FROM zapo_prime_bcku
-              WHERE zdate     BETWEEN lv_month_start AND lv_yesterday
-                AND material  = lw_fetch_outtab-material
-                AND location  = lw_fetch_outtab-location
-                AND div       = lw_fetch_outtab-div
-                AND grp_cust  = lw_fetch_outtab-grp_cust
-                AND dist_chan = lw_fetch_outtab-dist_chan.
-            IF sy-subrc = 0.
-              lv_saved_prime = lv_sum_mt + lv_sum_nt.
-            ENDIF.
-          ENDIF.
-
-          IF lv_so_nt_kl > lv_saved_prime.
-            lv_so_nt_kl = lv_so_nt_kl - lv_saved_prime.
-          ELSE.
-            CLEAR lv_so_nt_kl.
-          ENDIF.
-
-          lw_fetch_outtab-no_touch     = lv_so_nt_kl.
-          lw_fetch_outtab-inc_ord_quan = lv_so_nt_kl.
-          CLEAR lw_fetch_outtab-manual_touch.
-        ENDIF.
-```
-
-### 3.4 SS2 guardrails
-
-| Keep | Do not change |
-|------|----------------|
-| Plant RDD filter (`CHANGE-KL-RDD2`) above this block | Old-param `ELSE` date window |
-| Depot rows in `lt_fetch_keep` | `get_data` / CHANGE F |
-
----
-
-## 4. STEP SS1 — `collect_final_output` (include KL in backup)
-
-### 4.1 Find block A — Obs2 exclude
-
-Search:
+**Find:**
 
 ```abap
 *--- Pure stock-strategy KL: no PAG / no UA -> never write ZAPO_PRIME_BCKU
 ```
 
-### 4.2 Replace exclude with Old-param-only gate
-
-**Replace:**
+**Replace CONTINUE block with:**
 
 ```abap
-      IF lv_kl_hit = abap_true
-         AND gw_output-alloc_quan   = 0
-         AND gw_output-manual_touch = 0
-         AND gw_output-p_usr_adj    = 0.
-        CONTINUE.
-      ENDIF.
-```
-
-**With:**
-
-```abap
-*--- SS1A: Old param only — pure KL never in ZAPO_PRIME_BCKU (legacy Obs2)
-*--- New param — allow Stock Strategy backup (mid-month KL↔Allocation)
+*--- SS1A: Old only — exclude pure KL from BCKU (legacy)
+*--- New: store Existing_NT + KL in NO_TOUCH (R1)
       READ TABLE gt_zapoparam TRANSPORTING NO FIELDS
         WITH KEY param1 = 'GATP'.
       IF sy-subrc <> 0.
@@ -184,18 +145,14 @@ Search:
       ENDIF.
 ```
 
-### 4.3 Find block B — after `merge_kl` / `SORT lt_kl_chk`
+Effect: rows already on `lt_output` keep **existing** `no_touch` (CHANGE F = existing + KL in SO) and are **written** to `ZAPO_PRIME_BCKU-NO_TOUCH`.
 
-Immediately **after**:
+### 3.2 SS1B — Append pure-KL CVCs missing from `lt_output`
 
-```abap
-    SORT lt_kl_chk BY material location dist_chan div grp_cust.
-```
-
-**Insert:**
+**Place after `SORT lt_kl_chk ...` and BEFORE `lt_ouput_t = lt_output` / FAE SELECT.**
 
 ```abap
-*--- SS1B: New param — append missing KL CVCs into lt_output for backup
+*--- SS1B: New — pure KL CVC not on grid → still backup NO_TOUCH = KL
     READ TABLE gt_zapoparam TRANSPORTING NO FIELDS
       WITH KEY param1 = 'GATP'.
     IF sy-subrc = 0 AND lt_kl_chk IS NOT INITIAL.
@@ -209,6 +166,7 @@ Immediately **after**:
                    grp_cust  = lw_kl_chk-grp_cust
           BINARY SEARCH.
         IF sy-subrc <> 0.
+*--- Do NOT add KL onto existing keys (would double — CHANGE F already has KL)
           lw_kl_chk-date = sy-datum.
           APPEND lw_kl_chk TO lt_output.
         ENDIF.
@@ -216,178 +174,130 @@ Immediately **after**:
     ENDIF.
 ```
 
-### 4.4 Update comment at merge call
+`lw_kl_chk-no_touch` already set by current `merge_kl` (= KL sum). That is **Existing(0) + KL**.
 
-Change:
-
-```abap
-*--- FIX-KL-BAK Obs2: KL list via EXISTING merge - do NOT append to lt_output
-```
-
-To:
-
-```abap
-*--- SS1: KL list via merge_kl — New param appends missing CVCs (SS1B); Old keeps Obs2 exclude
-```
-
-### 4.5 Optional hardening — refresh today’s BCKU keys after append
-
-If pure KL was missing from `lt_ouput_t` before SELECT of today’s BCKU, either:
-
-- Move SS1B **before** `lt_ouput_t = lt_output` / FAE SELECT, **or**
-- After SS1B, rebuild `lt_ouput_t` and re-SELECT today’s `gt_prime_buk` for new keys.
-
-**Recommended order inside method:**
+### 3.3 Method order (mandatory)
 
 ```text
 1. merge_kl → lt_kl_chk
-2. SS1B append KL into lt_output          ← insert here
-3. lt_ouput_t = lt_output + FAE SELECT today BCKU
-4. loc type load
-5. LOOP lt_output → SS1A Old exclude → MODIFY buffer
+2. SS1B append into lt_output
+3. lt_ouput_t = lt_output + SELECT today BCKU
+4. LOOP save → SS1A Old exclude only
 ```
 
-If current code builds `lt_ouput_t` **before** SS1B, **move** SS1B up so FAE includes new KL materials.
+### 3.4 Comment update
+
+```abap
+*--- SS1: KL via merge — New appends missing CVCs for NO_TOUCH backup; Old keeps Obs2 exclude
+```
 
 ---
 
-## 5. STEP SS3 — `pull_data_prime_buck` (no Plant New KL SO add)
+## 4. STEP SS3 — Display MTD uses stored `NO_TOUCH` (no double)
 
-### 5.1 Find
-
-Search:
+**Find:**
 
 ```abap
-*--- MTD: BCKU + KL additive (legacy + new param)
 *--- New param: KL not in ZAPO_PRIME_BCKU (Obs2) -> add from SO like old
 ```
 
-### 5.2 Update header comment
+**In both** `lt_apo_so_list_mt` and `lt_apo_so_list_nt` loops, after `loc_type` known:
 
 ```abap
-*--- MTD: BCKU + KL SO additive
-*--- SS3: New Plant(1001) — KL now in ZAPO_PRIME_BCKU → do NOT add from SO
-*---      Old + Depot(1002) — keep KL SO additive
-```
-
-### 5.3 Inside both KL loops (`lt_apo_so_list_mt` and `lt_apo_so_list_nt`)
-
-After `loc_type` is known (`gw_loc_type_sto-loc_type`), **before** `lv_kl_take` logic, add:
-
-```abap
-*--- SS3: New Plant — KL already in BCKU
+*--- SS3: New Plant — KL already in BCKU.NO_TOUCH → do not add SO again (R2)
             IF lv_new_gatp_param = abap_true
             AND gw_loc_type_sto-loc_type = '1001'.
               CONTINUE.
             ENDIF.
 ```
 
-Apply in **both** loops:
-
-1. `LOOP AT lt_apo_so_list_mt ...`
-2. `LOOP AT lt_apo_so_list_nt ...`
-
-### 5.4 What stays
-
-| Case | Behaviour |
+| Case | After SS3 |
 |------|-----------|
-| New + Plant `1001` | **No** SO KL add (BCKU only) |
-| New + Depot `1002` | Existing additive (unchanged) |
-| Old (any loc) | Existing additive (unchanged) |
+| New Plant | MTD NT = SUM(BCKU.NO_TOUCH) — same as stored |
+| New Depot / Old | Unchanged SO KL add |
 
 ---
 
-## 6. Syntax / activate
+## 5. STEP SS2 — Optional only
 
-| Step | Action |
-|------|--------|
-| 1 | Check → Activate `ZAPO_GATP_ALLOCATION_F005` |
-| 2 | Resolve any unused-variable warnings for SS2 DATA |
-| 3 | Ensure `gt_zapoparam` / `lv_new_gatp_param` still filled as today |
-| 4 | Release only after T1–T6 |
+**Do not implement SS2 (MTD SELECT netting inside `merge_kl`) in the first transport** unless:
+
+- Pure KL next-day popup still reappears after SS1+SS3, **and**
+- Product accepts netting inside merge for FIX-KL-POP.
+
+Rationale for R1/R3: CHANGE F already nets MTD BCKU for grid CVCs; SS2 is extra surface area on a shared display method.
+
+If later needed, use the SS2 block from analysis doc v2 — not required for “store existing + KL”.
 
 ---
 
-## 7. Test plan (execute in order)
+## 6. What must stay untouched (R3)
 
-### 7.1 Setup
+| Object / logic | Action |
+|----------------|--------|
+| CHANGE F Plant NT formula | **No change** |
+| CHANGE-P1 Plant-only / Depot Old | **No change** |
+| KL RDD Plant filters | **No change** |
+| Old param Obs2 exclude | **Kept** via SS1A |
+| Old / Depot MTD KL SO add | **Kept** |
+| FIX-KL-POP loop structure | **No change** (still sums `gt_fetch_outtab`) |
+| Dashboard ALV build | **No change** |
 
-| Item | Value |
-|------|--------|
-| Param | `NT_MT_NEW` / `REPORT_NEW` active |
-| Location | Plant `1001` |
-| Material | Stock strategy with `ZAPO_SO_LIST-REQ_NT = 'KL'`, confirmed `BMENG > 0`, `EDATU = sy-datum` |
-| Run | `ZGATPDB` with **Data Backup** |
+---
 
-### 7.2 Cases
+## 7. Test plan
 
-| ID | Steps | Pass criteria |
-|----|--------|----------------|
-| **T1** | Backup with pure KL CVC | SE16 `ZAPO_PRIME_BCKU`: row for today, `NO_TOUCH` > 0 |
-| **T2** | Next calendar day, same open demand (per RDD rule) | NT does **not** fully reappear; nets via MTD BCKU |
-| **T3** | Change material to Allocation mid-month; re-run | Prior KL BCKU rows remain; new NT uses CHANGE F as today |
-| **T4** | Allocation → KL mid-month | Continues writing BCKU; history intact |
-| **T5** | MTD popup New Plant | Totals = SUM(BCKU); **no** double vs SO KL |
-| **T6** | Switch to Old `NT_MT`; backup pure KL | **No** new KL-only BCKU policy (legacy exclude); MTD still SO-adds KL |
-
-### 7.3 Verification SQL
+| ID | Steps | Pass |
+|----|--------|------|
+| **T1** | New Plant pure KL + Backup | `ZAPO_PRIME_BCKU-NO_TOUCH` = KL qty (> 0) |
+| **T2** | Allocation-only CVC backup | `NO_TOUCH` same as before SS1 (regression) |
+| **T3** | CVC with Alloc + KL | `NO_TOUCH` = CHANGE F value; **not** CHANGE F + KL again |
+| **T4** | Daily popup | NT matches stored / grid + FIX-KL-POP; no new side formula |
+| **T5** | MTD New Plant | = SUM(BCKU); **not** BCKU + SO KL |
+| **T6** | Old param | Pure KL still excluded from BCKU; MTD still SO-adds KL |
 
 ```sql
--- Backup after T1
-SELECT zdate, material, location, no_touch, manual_touch,
-       inc_ord_quan, alloc_quan
+SELECT zdate, material, location, no_touch, manual_touch, alloc_quan
   FROM zapo_prime_bcku
- WHERE material = '<MAT>'
-   AND location = '<WERKS>'
+ WHERE material = '<MAT>' AND location = '<WERKS>'
  ORDER BY zdate;
-
--- SO strategy
-SELECT edatu, req_nt, req_mt, bmeng, wmeng, vbeln
-  FROM zapo_so_list
- WHERE matnr  = '<MAT>'
-   AND werks  = '<WERKS>'
-   AND delind = ' '
-   AND abgru  = ' '
- ORDER BY edatu, req_nt;
 ```
 
 ---
 
 ## 8. Rollback
 
-| If | Action |
-|----|--------|
-| Double count on MTD | Revert SS3 first (restore Plant SO add) **or** fix SS1/SS2 qty |
-| Pure KL still missing from BCKU | Check SS1B order vs FAE SELECT; confirm `lt_kl_chk` not empty |
-| Old param changed | Restore SS1A `sy-subrc <> 0` gate |
-| Full rollback | Revert F005 to pre-TR version |
+| Symptom | Action |
+|---------|--------|
+| MTD Plant doubled | Ensure SS3 in both loops |
+| KL missing in BCKU | SS1B before FAE; SS1A not skipping New |
+| Alloc NT changed | Revert any accidental CHANGE F / SS2 edits |
+| Full rollback | Revert F005 TR |
 
 ---
 
-## 9. Checklist (sign-off)
+## 9. Sign-off checklist
 
-- [ ] SS2 activated — netted KL qty in `merge_kl`
-- [ ] SS1B append before today’s BCKU FAE SELECT
-- [ ] SS1A Old-only exclude
-- [ ] SS3 New Plant skip in **both** MT and NT KL loops
+- [ ] SS1A — New saves pure KL `NO_TOUCH`
+- [ ] SS1B — append before FAE; no double-add on existing keys
+- [ ] SS3 — New Plant MTD no SO KL add (MT + NT loops)
+- [ ] SS2 **not** in first TR (unless T2 fails)
 - [ ] T1–T6 passed
-- [ ] Old param smoke test OK
-- [ ] Depot New smoke test OK (legacy additive)
-- [ ] Transport documented: “Include Stock Strategy KL in ZAPO_PRIME_BCKU (New param)”
+- [ ] Old / Depot smoke OK
+- [ ] CHANGE F / report generation unchanged
 
 ---
 
-## 10. Quick reference — files / comments
+## 10. Summary verdict
 
-| Search string after impl | Meaning |
-|--------------------------|---------|
-| `SS1A` / `SS1B` | Backup include |
-| `SS2` | merge_kl netting |
-| `SS3` | MTD Plant no SO KL add |
-| `FIX-KL-BAK Obs2` | Replaced by SS1 comments |
+| Requirement | Guide alignment |
+|-------------|-----------------|
+| R1 Store KL in `NO_TOUCH` (= existing + KL) | **SS1** delivers; CHANGE F already embeds KL for grid CVCs |
+| R2 Same for display | **SS3** makes MTD use BCKU; daily FIX-KL-POP kept |
+| R3 Do not disturb report generation | **Do not** change CHANGE F; **defer SS2**; Old/Depot untouched |
 
-**Related analysis:** `ZGATPDB_StockStrategy_Include_Backup_MidMonth_Switch_Code_Correction.md`
+**Previous v1.0 over-weighted SS2 netting.** For this requirement, ship **SS1 + SS3** only.
 
 ---
 
-*End of Implementation Guide*
+*End of Implementation Guide v1.1*
